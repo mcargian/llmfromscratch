@@ -1,0 +1,165 @@
+# Ch 2 - Basic Byte Pair Encoder (BPE)
+
+```elixir
+Mix.install([
+  {:req, "~> 0.5"}
+])
+```
+
+## BPE Intro
+
+A small, learning-oriented byte pair encoder (BPE) written in Elixir while working through Chapter 2 of *Build a Large Language Model (from Scratch)*. The focus is on clarity and understanding rather than completeness or performance. More context is available at [https://latentwords.com](https://www.latentwords.com/a-basic-byte-pair-encoder-in-elixir/)
+
+## Text Normalization and Tokenization
+
+Normalize the text, split it into tokens, then operate at the byte level by appending an explicit end-of-word marker.
+
+```elixir
+defmodule Text do
+
+  @doc "Reads a UTF-8 text file."
+  def read_file(path) do
+    File.read!(path)
+  end
+
+  # Returns a list of tokens (strings) after normalization.
+  def tokens(text) when is_binary(text) do
+    text
+    |> String.downcase()
+    |> String.split(~r/([,.:;?_!"()\']|--|\s)/, trim: true, include_captures: true)
+    |> Enum.reject(&(&1 in [" ", "\n", "\t", "\r"]))
+  end
+
+  def token_to_symbols(token) when is_binary(token) do
+    :binary.bin_to_list(token) ++ [:eow]
+  end
+
+  # Returns a list of symbol lists (one per token).
+  def text_to_corpus(text) when is_binary(text) do
+    text
+    |> tokens()
+    |> Enum.map(&token_to_symbols/1)
+  end
+
+end
+```
+
+A quick check of the tokens created.
+
+```elixir
+file = Req.get!("https://raw.githubusercontent.com/mcargian/llmfromscratch/main/files/the-verdict.txt").body
+tokens =
+  file
+  |> Text.text_to_corpus()
+```
+
+## Learning Structure Through Frequency
+
+See the blog post for a description of the loop, frequency counting and merging.
+
+```elixir
+defmodule BPE do
+  alias Text
+
+  def train(text, num_merges) when is_binary(text) and is_integer(num_merges) and num_merges >= 0 do
+    text
+    |> Text.text_to_corpus()
+    |> learn_merges(num_merges)
+  end
+
+  def encode(text, merges) when is_binary(text) and is_list(merges) do
+    text
+    |> Text.text_to_corpus()
+    |> apply_merges_in_order(merges)
+  end
+
+  # Learn merges from an existing corpus (list of symbol lists).
+  def learn_merges(corpus, num_merges) when is_list(corpus) and is_integer(num_merges) and num_merges >= 0 do
+    {final_corpus, merges_rev} =
+      Enum.reduce_while(1..num_merges, {corpus, []}, fn _step, {corpus_acc, merges_acc} ->
+        counts = pair_frequencies(corpus_acc)
+
+        if map_size(counts) == 0 do
+          {:halt, {corpus_acc, merges_acc}}
+        else
+          best_pair = most_frequent_pair(counts)
+          new_corpus = apply_merge(corpus_acc, best_pair)
+          {:cont, {new_corpus, [best_pair | merges_acc]}}
+        end
+      end)
+
+    {final_corpus, Enum.reverse(merges_rev)}
+  end
+
+  # Encoding: apply learned merges
+  def apply_merges_in_order(corpus, merges) do
+    Enum.reduce(merges, corpus, fn pair, corpus_acc ->
+      apply_merge(corpus_acc, pair)
+    end)
+  end
+
+  # Frequency counting
+  def pair_frequencies(corpus) do
+    Enum.reduce(corpus, %{}, &count_adjacent_pairs/2)
+  end
+
+  defp count_adjacent_pairs([a, b | rest], acc) do
+    acc = Map.update(acc, {a, b}, 1, &(&1 + 1))
+    count_adjacent_pairs([b | rest], acc)
+  end
+
+  defp count_adjacent_pairs(_, acc), do: acc
+
+  def most_frequent_pair(pair_counts) do
+    pair_counts
+    |> Enum.max_by(fn {_pair, count} -> count end)
+    |> elem(0)
+  end
+
+  # Merge a pair everywhere in the corpus.
+  def apply_merge(corpus, pair), do: Enum.map(corpus, &merge_symbols(&1, pair))
+
+  # Merge a pair inside a single symbol list.
+  def merge_symbols(symbols, pair), do: do_merge(symbols, pair)
+
+  # When the next two symbols match the target pair, merge them into a single token
+  defp do_merge([a, b | rest], {a, b}), do: [{:merge, a, b} | do_merge(rest, {a, b})]
+  # When the symbols do not match, keep the current symbol and continue scanning
+  defp do_merge([x | rest], pair), do: [x | do_merge(rest, pair)]
+  # When fewer than two symbols remain, stop the scan
+  defp do_merge([], _pair), do: []
+
+  # to better understand what is happening during encoding,
+  # show the symbols as a string with subword boundaries |
+  def symbol_to_string(:eow), do: ""
+  def symbol_to_string({:merge, a, b}), do: symbol_to_string(a) <> symbol_to_string(b)
+  def symbol_to_string(byte) when is_integer(byte), do: <<byte>>
+
+  def show_boundaries(symbols) do
+    symbols
+    |> Enum.reject(&(&1 == :eow))
+    |> Enum.map(&symbol_to_string/1)
+    |> Enum.join("|")
+  end
+
+end
+
+{_final_corpus, merges} =
+  file
+  |> BPE.train(100)
+:ok
+```
+
+As a final step, encode a sentence to see the encodings applied.
+
+```elixir
+BPE.encode("I had always thought it would have been Rome or Florence.", merges)
+```
+
+The `show_pieces/1` helper is just a way to render merged symbols back into readable text for inspection and to see boundaries.
+
+```elixir
+BPE.encode("I had always hadthat word", merges)
+|> Enum.map(&BPE.show_boundaries/1)
+|> IO.inspect(label: "decoded tokens")
+```

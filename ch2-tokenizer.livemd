@@ -68,12 +68,12 @@ end
 
 ## Load Raw Text and Build Vocabulary
 
-Load "The Verdict" as training material and build a tokenizer based on its content. If this link is ever broken, simply load the file from [Wikipedia](https://en.wikisource.org/wiki/The_Verdict)
+Load "The Verdict" as training material and build a tokenizer based on its content.
 
 ```elixir
 
 tokens =
-  Req.get!("https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt").body
+  Req.get!("https://raw.githubusercontent.com/mcargian/llmfromscratch/main/files/the-verdict.txt").body
   |> Tokenizer.tokenize()
 
 %{token_to_id: token_to_id, id_to_token: id_to_token} = Tokenizer.build_vocab(tokens)
