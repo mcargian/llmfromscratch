@@ -1,0 +1,100 @@
+# Ch 2 - Simple Tokenizer
+
+```elixir
+Mix.install([
+  {:req, "~> 0.5"}
+])
+```
+
+## Tokenizer Intro
+
+These are working examples from my attempt to implement a simplistic tokenizer from Chapter 2 of "Build a Large Language Model (from Scratch)" in Elixir. The code is written for understanding rather than maximal efficiency or idiomatic perfection. It reflects how the ideas were built up while learning the material. More context is available at [https://latentwords.com](https://www.latentwords.com/working-notes-on-building-an-llm-in-elixir-tokenization/)
+
+## Build Vocabulary
+
+```elixir
+defmodule Tokenizer do
+
+  def tokenize(text) do
+    text
+    |> String.split(~r/([,.:;?_!"()\']|--|\s)/, trim: true, include_captures: true)
+    |> Enum.reject(&(&1 in [" ", "\n"]))
+  end
+
+  def build_vocab(tokens) do
+    token_to_id =
+      tokens
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.with_index()
+      |> Map.new()
+
+    # Add special end of word token at the end
+    token_to_id =
+      token_to_id
+      |> Map.put("|unk|", map_size(token_to_id))
+
+    # Create reverse mapping (id -> token)
+    id_to_token = Map.new(token_to_id, fn {token, id} -> {id, token} end)
+    %{token_to_id: token_to_id, id_to_token: id_to_token}
+  end
+
+end
+```
+
+## Encoder and Decoder
+
+```elixir
+defmodule Codec do
+    def encode(text, token_to_id) do
+      unk_id = Map.fetch!(token_to_id, "|unk|")
+
+      text
+      |> Tokenizer.tokenize()
+      |> Enum.map(&Map.get(token_to_id, &1, unk_id))
+    end
+
+    def decode(ids, id_to_token) do
+      ids
+      |> Enum.map(&Map.fetch!(id_to_token, &1))
+      |> Enum.join(" ")
+      # Replace spaces before punctuation
+      |> String.replace(~r/\s+([,\.!\?"\(\)'])/, "\\1")
+      # Remove spaces around double hyphens
+      |> String.replace(~r/\s*(--)\s*/, "\\1")
+    end
+end
+```
+
+## Load Raw Text and Build Vocabulary
+
+Load "The Verdict" as training material and build a tokenizer based on its content. If this link is ever broken, simply load the file from [Wikipedia](https://en.wikisource.org/wiki/The_Verdict)
+
+```elixir
+
+tokens =
+  Req.get!("https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt").body
+  |> Tokenizer.tokenize()
+
+%{token_to_id: token_to_id, id_to_token: id_to_token} = Tokenizer.build_vocab(tokens)
+
+IO.puts("Vocabulary size: #{map_size(token_to_id)}")
+
+```
+
+## Test encoding and decoding a sample sentence
+
+Encode and decode a sample text block that includes a word not in the story’s vocabulary to confirm that everything works as expected.
+
+```elixir
+test_text = "I HAD always thought--Jack Gisburn rather a cheap crazy genius."
+encoded = Codec.encode(test_text, token_to_id)
+decoded = Codec.decode(encoded, id_to_token)
+
+
+IO.inspect(test_text, label: "Original")
+IO.inspect(encoded, label: "Encoded")
+IO.inspect(decoded, label: "Decoded")
+
+:ok
+```
