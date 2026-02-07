@@ -1,0 +1,122 @@
+# Ch 2 - Sliding Windows and Embeddings
+
+```elixir
+Mix.install([
+  {:gpt3_tokenizer, "~> 0.1.1"},
+  {:nx, "~> 0.7.0"},
+  {:req, "~> 0.5.17"}
+])
+```
+
+## About this Notebook
+
+A small, learning-oriented word and positional embedding notebook written in Elixir while working through Chapter 2 of *Build a Large Language Model (from Scratch)*. The focus is on clarity and understanding rather than completeness or performance. More context is available at [https://latentwords.com](https://www.latentwords.com/from-tokens-to-training-data-building-sliding-window-embeddings-in-elixir/)
+
+## Initialize Embeddings
+
+Create random embedding matrices for tokens and for token positions.
+
+```elixir
+defmodule Embeddings do
+  defstruct scale: 0.02,
+            seed: 0
+  
+  # Use default scale and seed when no config is provided
+  def init_embedding(shape) do
+    init_embedding(shape, %__MODULE__{})
+  end
+  
+  # Initialize an embedding matrix of the given shape with small random values
+  def init_embedding({rows, cols}, %__MODULE__{} = config) do
+    {emb, _} =
+      Nx.Random.uniform(
+        Nx.Random.key(config.seed),
+        0.0,
+        1.0,
+        shape: {rows, cols},
+        type: {:f, 32}
+      )
+
+    Nx.multiply(emb, config.scale)
+  end
+end
+```
+
+## Load tokens and initialize embeddings
+
+First, we read the document, tokenize the text, and then initialize the embeddings.
+
+```elixir
+text = Req.get!("https://raw.githubusercontent.com/mcargian/llmfromscratch/main/files/the-verdict.txt").body
+tokens = Gpt3Tokenizer.encode(text)
+
+vocab_size = Enum.max(tokens) + 1
+embedding_dim = 8
+max_length = 4
+token_embedding = Embeddings.init_embedding({vocab_size, embedding_dim})
+pos_embedding   = Embeddings.init_embedding({max_length, embedding_dim})
+:ok
+```
+
+## Sliding Window and Apply Embeddings
+
+This module creates sliding windows of token IDs, batches them into tensors, and then replaces input token IDs with token and positional embeddings.
+
+```elixir
+defmodule SlidingWindow do
+  defstruct stride: 1,
+            batch_size: 1,
+            max_length: 4
+  
+  # Stream the tokens for batch training
+  def stream_tokens(tokens, opts) when is_list(opts) do
+     stream_tokens(tokens, struct!(__MODULE__, opts))
+  end
+
+  def stream_tokens(tokens, %__MODULE__{} = config) do
+     tokens
+     |> Stream.chunk_every(config.max_length + 1, config.stride, :discard)
+     |> Stream.map(&create_input_target_pair(&1, config.max_length))
+     |> Stream.chunk_every(config.batch_size, config.batch_size, :discard)
+     |> Stream.map(&batch_to_tensors/1)
+  end
+
+  # Create input and target ID pairs from a window of tokens
+  defp create_input_target_pair(window, max_length) do
+    input = Enum.take(window, max_length)
+    target = window |> tl() |> Enum.take(max_length)
+    {input, target}
+  end
+
+  # Convert a batch of input and target ID pairs to tensors
+  defp batch_to_tensors(batch) do
+    {xs, ys} = Enum.unzip(batch)
+    {Nx.tensor(xs, type: {:s, 64}), Nx.tensor(ys, type: {:s, 64})}
+  end
+
+  # Replace input token IDs with their embedding vectors; targets remain token IDs
+  def embed_batch({xs, ys}, token_embedding, pos_embedding) do
+    xs_embedded = Nx.take(token_embedding, xs)
+    xs_with_pos = Nx.add(xs_embedded, pos_embedding)
+    {xs_with_pos, ys}
+  end
+
+  # Lazily apply embedding lookup to the inputs of each batch in the stream
+  def embed_stream(stream, token_embedding, pos_embedding) do
+    Stream.map(stream, &embed_batch(&1, token_embedding, pos_embedding))
+  end
+
+end
+```
+
+## From Tokens to Training Data
+
+Finally, we create a stream that produces embedded inputs and target token IDs. The input embeddings include positional embeddings so the model can learn how position affects each token. Calling `Enum.take(1)` forces evaluation of the stream and returns the first batch, which contains the input embeddings (with positional information) and the target token IDs.
+
+```elixir
+stream =
+  tokens
+  |> SlidingWindow.stream_tokens(batch_size: 1, max_length: max_length)
+  |> SlidingWindow.embed_stream(token_embedding, pos_embedding)
+  |> Enum.take(1)
+```
