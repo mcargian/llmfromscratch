@@ -1,0 +1,143 @@
+# Ch3 - Self Attention
+
+```elixir
+Mix.install([
+  {:gpt3_tokenizer, "~> 0.1.1"},
+  {:nx, "~> 0.10.0"},
+  {:exla, "~> 0.10.0"}
+])
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Self Attention without training weights
+
+A small, learning-oriented implementation of self-attention written in Elixir while working through Chapter 3 of *Build a Large Language Model (from Scratch)*. The goal here is clarity and intuition rather than completeness or performance. For a full explanation of the concepts and design decisions, see the accompanying blog post: [https://latentwords.com](https://www.latentwords.com/understanding-self-attention-in-language-models/)
+
+Before introducing the full transformer attention mechanism, it helps to start with a simplified version. In this module we compute self-attention without any trainable weights, using the embedding vectors directly. This lets us focus on the core mechanics of attention.
+
+```elixir
+defmodule SelfAttention do
+  import Nx.Defn
+
+  # Randomly initialize embedding vectors for a given vocabulary size and embedding dimension
+   def init_embedding({rows, cols}, seed \\ 0) do
+    {embeddings, _key} =
+      Nx.Random.uniform(
+        Nx.Random.key(seed),
+        0.0,
+        1.0,
+        shape: {rows, cols},
+        type: {:f, 32}
+      )
+
+    embeddings
+  end
+
+  # Replace input token IDs with their embedding vectors
+  def embed(token_ids, token_embedding) do
+    Nx.take(token_embedding, token_ids)
+  end
+
+  # Step 1: Each row is the unnormalized scores for token i attending to every other token
+  def attention_scores(embeddings) do
+    Nx.dot(embeddings, Nx.transpose(embeddings))
+  end
+
+  # Step 2: Normalize each row 
+  defn softmax(scores) do
+    max = Nx.reduce_max(scores, axes: [1], keep_axes: true)
+    exp = Nx.exp(scores - max)
+    exp / Nx.sum(exp, axes: [1], keep_axes: true)
+  end
+
+  # Step 3: Each row i of the result is the context vector for token i
+  def context_vectors(embeddings, attn_weights) do
+    Nx.dot(attn_weights, embeddings)
+  end
+end
+```
+
+First let's get the tokens and embeddings.
+
+```elixir
+text = "Your journey starts with one step"
+tokens = Gpt3Tokenizer.encode(text)
+
+vocab_size = Enum.max(tokens) + 1
+embedding_dim = 8
+token_embeddings = SelfAttention.init_embedding({vocab_size, embedding_dim})
+token_ids = Nx.tensor(tokens)
+embeddings = SelfAttention.embed(token_ids, token_embeddings)
+:ok
+```
+
+The next step is to compute similarity scores between every pair of words in the sentence. We do this by taking the dot product between each word’s embedding vector and the embedding vectors of all other words. The goal is to measure how closely related each word might be to the others in this specific context.
+
+Once we have those scores, we normalize them with softmax so each word produces a set of attention weights. Finally, we use those weights to compute context vectors, weighted combinations of the input embeddings that blend information from the most relevant words in the sentence.
+
+```elixir
+attn_scores = SelfAttention.attention_scores(embeddings)
+attn_weights = SelfAttention.softmax(attn_scores)
+context = SelfAttention.context_vectors(embeddings, attn_weights)
+IO.inspect(context, label: "Context vectors [seq_len x emb_dim]")
+:ok
+```
+
+## Trainable Self Attention with Query, Key and Value Matrix
+
+The simplified version above helps explain the mechanics of attention, but real transformers do not compare the raw embeddings directly. Instead, they learn three separate linear projections that transform the input embeddings into queries (Q), keys (K), and values (V).
+
+Because the surrounding mechanics are the same, this module reuses the earlier embedding initialization and softmax functions and focuses only on the new trainable pieces.
+
+```elixir
+defmodule SelfAttentionWithTrainableWeights do
+  import Nx.Defn
+
+  def init_weights({d_in, d_out}, seed) do
+    limit = :math.sqrt(6.0 / (d_in + d_out))
+
+    {weights, _key} =
+      Nx.Random.uniform(
+        Nx.Random.key(seed),
+        -limit,
+        limit,
+        shape: {d_in, d_out},
+        type: {:f, 32}
+      )
+
+    weights
+  end
+
+  defn attention(x, w_q, w_k, w_v) do
+    q = Nx.dot(x, w_q)
+    k = Nx.dot(x, w_k)
+    v = Nx.dot(x, w_v)
+
+    scale = Nx.sqrt(Nx.axis_size(k, 1))
+    scores = Nx.dot(q, Nx.transpose(k)) / scale
+
+    weights = SelfAttention.softmax(scores)
+    context = Nx.dot(weights, v)
+
+    {weights, context}
+  end
+
+end
+:ok
+```
+
+`d_out` defines the size of those projected vectors (the attention head dimension). We initialize `w_q`, `w_k`, and `w_v`, then pass them along with the embeddings into the attention function to compute the attention weights and resulting context vectors. In a real model these weights would be updated during training by an optimizer.
+
+```elixir
+d_out = 4  # head / projection dimension (can differ from embedding_dim)
+
+# Trainable weight matrices — in a real model these are updated by the optimizer
+w_q = SelfAttentionWithTrainableWeights.init_weights({embedding_dim, d_out}, 1)
+w_k = SelfAttentionWithTrainableWeights.init_weights({embedding_dim, d_out}, 2)
+w_v = SelfAttentionWithTrainableWeights.init_weights({embedding_dim, d_out}, 3)
+
+{attn_weights, context} = SelfAttentionWithTrainableWeights.attention(embeddings, w_q, w_k, w_v)
+IO.inspect(attn_weights, label: "Attention weights [seq_len x seq_len]")
+IO.inspect(context, label: "Context vectors [seq_len x d_out]")
+:ok
+```
