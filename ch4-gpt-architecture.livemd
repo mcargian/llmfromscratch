@@ -1,0 +1,469 @@
+# Ch 4 - GPT model to generate text
+
+```elixir
+Mix.install([
+  {:gpt3_tokenizer, "~> 0.1.1"},
+  {:nx, "~> 0.10.0"},
+  {:exla, "~> 0.10.0"}
+])
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Introduction
+
+A from-scratch implementation of a GPT model in Elixir, built step by step while working through _Build a Large Language Model (from Scratch)_. Like the previous notebooks, the goal here is clarity and intuition rather than completeness or performance. For a full explanation of the concepts and design decisions, see the accompanying blog post [https://www.latentwords.com/from-attention-to-a-full-transformer-block/](https://www.latentwords.com/from-attention-to-a-full-transformer-block/)
+
+In the previous step, we built multi-head causal attention with masking and dropout. In this notebook, we build on that by adding a feed-forward network with GELU activations and introducing shortcut (residual) connections, turning attention into a full transformer block that can be stacked. We then go one step further and assemble a complete GPT-style model with embeddings and an output layer. While the model is untrained, it runs end-to-end and can generate text, showing how all the pieces fit together.
+
+## Helper functions
+
+```elixir
+defmodule Embedding do
+  def init_embedding({rows, cols}, key) do
+    Nx.Random.uniform(key, 0.0, 1.0, shape: {rows, cols})
+  end
+
+  def embed(token_ids, token_embeddings) do
+    Nx.take(token_embeddings, token_ids)
+  end
+end
+
+defmodule Initializers do
+  def glorot_uniform({d_in, d_out}, key) do
+    limit = :math.sqrt(6.0 / (d_in + d_out))
+    Nx.Random.uniform(key, -limit, limit, shape: {d_in, d_out}, names: [:in_dim, :out_dim])
+  end
+end
+```
+
+## Multi-head Attention
+
+The MultiHeadAttention module is largely the same as in the previous notebook. I refactored a few lines for readability, but the underlying logic has not changed from the a previous blog post: [https://www.latentwords.com/multi-head-attention-in-elixir/](https://www.latentwords.com/multi-head-attention-in-elixir/)
+
+If you are interested in how attention works e.g. how queries, keys, and values interact, how causal masking is applied, and how dropout is used during training please see the [Chapter 3 notebook](ch3-multi-head-attention.livemd). For this section, you can treat it as a given building block that takes in a sequence of embeddings and returns a context-aware representation of those same tokens.
+
+```elixir
+defmodule MultiHeadAttention do
+  import Nx.Defn
+
+  # Initializes multi-head attention projection weights.
+  # Raises if d_out is not divisible by num_heads.
+  def init({d_in, d_out}, num_heads, key) do
+    unless rem(d_out, num_heads) == 0 do
+      raise ArgumentError,
+            "d_out (#{d_out}) must be divisible by num_heads (#{num_heads})"
+    end
+
+    {w_q, key} = Initializers.glorot_uniform({d_in, d_out}, key)
+    {w_k, key} = Initializers.glorot_uniform({d_in, d_out}, key)
+    {w_v, key} = Initializers.glorot_uniform({d_in, d_out}, key)
+    {w_o, key} = Initializers.glorot_uniform({d_out, d_out}, key)
+
+    w_o = Nx.rename(w_o, [:merged_dim, :out_dim])
+    {%{w_q: w_q, w_k: w_k, w_v: w_v, w_o: w_o, num_heads: num_heads}, key}
+  end
+
+  # Forward pass for batched multi-head causal self-attention.
+  def attention(x, %{w_q: w_q, w_k: w_k, w_v: w_v, w_o: w_o, num_heads: num_heads}, key, opts \\ []) do
+    training = Keyword.get(opts, :training, false)
+    dropout_rate = Keyword.get(opts, :dropout_rate, 0.1)
+
+    {q, k, v, scale} = project_and_split(x, w_q, w_k, w_v, num_heads)
+
+    if training do
+      keep_prob = 1.0 - dropout_rate
+      attention_train(q, k, v, w_o, scale, key, keep_prob)
+    else
+      weights = compute_attn_weights(q, k, scale)
+      context = compute_context(weights, v, w_o)
+      {weights, context, key}
+    end
+  end
+
+  # Projects x through w_q/w_k/w_v and splits into heads.
+  defp project_and_split(x, w_q, w_k, w_v, num_heads) do
+    {batch, seq_len, _d_in} = Nx.shape(x)
+    d_out = Nx.axis_size(w_q, :out_dim)
+    head_dim = div(d_out, num_heads)
+    scale = Nx.tensor(:math.sqrt(head_dim))
+
+    split = fn w, seq_name ->
+      x
+      |> Nx.dot([:in_dim], w, [:in_dim])
+      |> Nx.rename([:batch, :seq, :out_dim])
+      |> Nx.reshape({batch, seq_len, num_heads, head_dim}, names: [:batch, seq_name, :head, :dim])
+      |> Nx.transpose(axes: [:batch, :head, seq_name, :dim])
+    end
+
+    {
+      split.(w_q, :query_pos),
+      split.(w_k, :key_pos),
+      split.(w_v, :value_pos),
+      scale
+    }
+  end
+
+  # Training path: applies inverted dropout to attention probabilities.
+  defn attention_train(q, k, v, w_o, scale, key, keep_prob) do
+    attn_weights = compute_attn_weights(q, k, scale)
+    {dropped_weights, new_key} = dropout(attn_weights, key, keep_prob)
+    context = compute_context(dropped_weights, v, w_o)
+    {dropped_weights, context, new_key}
+  end
+
+  # Scaled dot-product attention scores to softmax weights.
+  defnp compute_attn_weights(q, k, scale) do
+    q
+    |> Nx.dot([:dim], [:batch, :head], k, [:dim], [:batch, :head])
+    |> Nx.rename([:batch, :head, :query_pos, :key_pos])
+    |> Nx.divide(scale)
+    |> apply_causal_mask()
+    |> softmax()
+  end
+
+  # Weighted sum over values, merge heads, apply output projection.
+  defnp compute_context(weights, v, w_o) do
+    {batch, num_heads, seq_len, head_dim} = Nx.shape(v)
+    d_out = num_heads * head_dim
+
+    weights
+    |> Nx.dot([:key_pos], [:batch, :head], v, [:value_pos], [:batch, :head])
+    |> Nx.transpose(axes: [:batch, :query_pos, :head, :dim])
+    |> Nx.reshape({batch, seq_len, d_out}, names: [:batch, :seq, :merged_dim])
+    |> Nx.dot([:merged_dim], w_o, [:merged_dim])
+  end
+
+  # Inverted dropout: keep with probability `keep_prob`, scale by `1 / keep_prob`.
+  defn dropout(weights, key, keep_prob) do
+    {noise, new_key} = Nx.Random.uniform(key, shape: Nx.shape(weights))
+    mask = Nx.less(noise, keep_prob)
+    scaled = weights * mask / keep_prob
+    {scaled, new_key}
+  end
+
+  # Fills the strict upper triangle with -1e9 before softmax.
+  defn apply_causal_mask(scores) do
+    seq_len = Nx.axis_size(scores, :query_pos)
+    mask = Nx.broadcast(Nx.tri(seq_len, seq_len), scores)
+    Nx.select(mask, scores, Nx.broadcast(Nx.Constants.neg_infinity(), scores))
+  end
+
+  defn softmax(scores) do
+    max = Nx.reduce_max(scores, axes: [-1], keep_axes: true)
+    exp = Nx.exp(scores - max)
+    exp / Nx.sum(exp, axes: [-1], keep_axes: true)
+  end
+end
+```
+
+## Layer Normalization
+
+After building attention, the next step is stabilizing the values flowing through the network. Layer normalization does this by standardizing each token across its feature dimension, then applying a learned scale (gamma) and shift (beta). More info in the last blog post: blog post [https://www.latentwords.com/adding-layer-normalization-to-multi-head-attention/](https://www.latentwords.com/adding-layer-normalization-to-multi-head-attention/)
+
+```elixir
+defmodule LayerNorm do
+  import Nx.Defn
+
+  # Initialize scale (gamma) to 1s and shift (beta) to 0s
+  def init(d_model) do
+    %{
+      gamma: Nx.broadcast(1.0, {d_model}),
+      beta: Nx.broadcast(0.0, {d_model})
+    }
+  end
+
+  # Normalizes x over its last axis (the feature / embedding dimension).
+  defn normalize(x, params) do
+    %{gamma: gamma, beta: beta} = params
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    variance = Nx.mean(Nx.pow(x - mean, 2), axes: [-1], keep_axes: true)
+    x_norm = (x - mean) / Nx.sqrt(variance + 1.0e-5)
+    gamma * x_norm + beta
+  end
+end
+```
+
+## GELU activation function
+
+GELU serves as the activation function inside the feed-forward network. Unlike ReLU, which zeroes out negative values, GELU applies a smooth scaling that dampens small values while allowing larger ones to pass through.
+
+I used the standard tanh-based approximation, which is efficient and commonly used in transformer models.
+
+```elixir
+defmodule GELU do
+  import Nx.Defn
+  @sqrt_2_over_pi :math.sqrt(2.0 / :math.pi())
+
+  # GPT-2 tanh approximation of the Gaussian Error Linear Unit:
+  #   GELU(x) ≈ 0.5 · x · (1 + tanh(sqrt(2/π) · (x + 0.044715 · x³)))
+  defn activate(x) do
+    inner = @sqrt_2_over_pi * (x + 0.044715 * Nx.pow(x, 3))
+    0.5 * x * (1 + Nx.tanh(inner))
+  end
+end
+```
+
+## Feed Forward Network
+
+After attention mixes information across tokens, the feed-forward network processes each token independently. It consists of two linear layers with a GELU activation in between.
+
+The first layer expands the embedding dimension, typically by a factor of four, giving the model more space to work with. The GELU activation then introduces nonlinearity, and the second layer projects the representation back down to the original size.
+
+While attention handles relationships between tokens, the feed-forward network is where each token’s representation is reshaped and refined on its own.
+
+```elixir
+defmodule FeedForward do
+  import Nx.Defn
+
+  # Expand to 4x d_model dimention, apply GELU, then project back to d_model.
+  def init(d_model, key) do
+    {w1, key} = init_weight({d_model, 4 * d_model}, key)
+    {w2, key} = init_weight({4 * d_model, d_model}, key)
+
+    w1 = Nx.rename(w1, [:in_dim, :hidden_dim])
+    w2 = Nx.rename(w2, [:hidden_dim, :out_dim])
+    b1 = Nx.broadcast(Nx.tensor(0.0), {4 * d_model}) |> Nx.rename([:hidden_dim])
+    b2 = Nx.broadcast(Nx.tensor(0.0), {d_model})     |> Nx.rename([:out_dim])
+
+    {%{w1: w1, b1: b1, w2: w2, b2: b2}, key}
+  end
+
+  defp init_weight({d_in, d_out}, key) do
+    limit = :math.sqrt(6.0 / (d_in + d_out))
+    Nx.Random.uniform(key, -limit, limit, shape: {d_in, d_out})
+  end
+
+  # Intermediate hidden dim is 4·d_model; GELU between the two projections.
+  defn forward(x, params) do
+    %{w1: w1, b1: b1, w2: w2, b2: b2} = params
+
+    x
+    |> Nx.dot([:in_dim], w1, [:in_dim])
+    |> Nx.add(b1)
+    |> GELU.activate()
+    |> Nx.dot([:hidden_dim], w2, [:hidden_dim])
+    |> Nx.add(b2)
+  end
+end
+```
+
+## Transformer Block with Shortcut Connections
+
+The `TransformerBlock` module brings everything together.
+
+It combines multi-head attention and the feed-forward network, each wrapped with layer normalization and shortcut (residual) connections. Instead of replacing the input, each sublayer adds its output back to the original input, helping preserve information and stabilize training.
+
+This structure of attention, feed-forward, and residual connections is the core building block that gets stacked to form a full transformer model.
+
+```elixir
+defmodule TransformerBlock do
+
+  def init(%{d_model: d_model, num_heads: num_heads}, key) do
+    {attn_params, key} = MultiHeadAttention.init({d_model, d_model}, num_heads, key)
+    {ff_params,   key} = FeedForward.init(d_model, key)
+
+    params = %{
+      attn: attn_params,
+      ff:   ff_params,
+      ln1:  LayerNorm.init(d_model),
+      ln2:  LayerNorm.init(d_model)
+    }
+
+    {params, key}
+  end
+
+  def forward(x, %{attn: attn, ff: ff, ln1: ln1, ln2: ln2}, key, opts \\ []) do
+    training     = Keyword.get(opts, :training, false)
+    dropout_rate = Keyword.get(opts, :dropout_rate, 0.1)
+    keep_prob = 1.0 - dropout_rate
+
+    # multi-head causal self-attention
+    shortcut = x
+    x = LayerNorm.normalize(x, ln1)
+    {_weights, x, key} = MultiHeadAttention.attention(x, attn, key,
+                           training: training, dropout_rate: dropout_rate)
+
+    # Align axis names before the residual add.
+    x = Nx.rename(x, [:batch, :seq, :in_dim])
+    {x, key} = if training, do: MultiHeadAttention.dropout(x, key, keep_prob), else: {x, key}
+    x = Nx.add(shortcut, x)
+
+    # position-wise feed-forward network
+    shortcut =
+      x
+      |> LayerNorm.normalize(ln2)
+      |> FeedForward.forward(ff)
+      |> Nx.rename([:batch, :seq, :in_dim])
+
+    {x, key} = if training, do: MultiHeadAttention.dropout(x, key, keep_prob), else: {x, key}
+    x = Nx.add(shortcut, x)
+
+    {x, key}
+  end
+
+end
+```
+
+## GPTModel: Putting the Pieces Together
+
+We now bring these components together to form the GPT model. This module shows how stacking transformer blocks, combined with token embeddings and positional information, enables GPT to generate coherent text by predicting the next token in a sequence.
+
+```elixir
+defmodule GPTModel do
+
+  # Build all model parameters from config.
+  # Required keys: vocab_size, context_length, d_model, num_heads, n_layers, dropout_rate
+  def init(%{
+    vocab_size: vocab_size,
+    context_length: context_length,
+    d_model: d_model,
+    num_heads: num_heads,
+    n_layers: n_layers
+  }, key) do
+
+    # Learned lookup tables for tokens and positions
+    {tok_emb, key} = Embedding.init_embedding({vocab_size, d_model}, key)
+    {pos_emb, key} = Embedding.init_embedding({context_length, d_model}, key)
+
+    # Build n_layers transformer blocks
+    {blocks, key} =
+      Enum.reduce(1..n_layers, {[], key}, fn _, {acc, k} ->
+        {block, k} = TransformerBlock.init(%{d_model: d_model, num_heads: num_heads}, k)
+        {[block | acc], k}
+      end)
+
+    final_norm = LayerNorm.init(d_model)
+    {out_head, key} = Initializers.glorot_uniform({d_model, vocab_size}, key)
+    out_head = Nx.rename(out_head, [:in_dim, :vocab_dim])
+
+    params = %{
+      tok_emb:    tok_emb,
+      pos_emb:    pos_emb,
+      blocks:     blocks,
+      final_norm: final_norm,
+      out_head:   out_head
+    }
+
+    {params, key}
+  end
+  
+  # Forward pass.
+  # token_ids: [batch, seq]  →  logits: [batch, seq, vocab_size]
+  def forward(token_ids, params, key, opts \\ []) do
+    %{tok_emb: tok_emb, pos_emb: pos_emb, blocks: blocks,
+      final_norm: final_norm, out_head: out_head} = params
+
+    training     = Keyword.get(opts, :training, false)
+    dropout_rate = Keyword.get(opts, :dropout_rate, 0.0)
+    keep_prob    = 1.0 - dropout_rate
+
+    {_batch, seq_len} = Nx.shape(token_ids)
+
+    # Token embeddings: each id maps to a d_model vector
+    tok_x = Embedding.embed(token_ids, tok_emb)
+      |> Nx.rename([:batch, :seq, :in_dim])
+
+    # Positional embeddings: each position 0..seq_len-1 maps to a d_model vector
+    pos_ids = Nx.iota({seq_len})
+    pos_x   = Embedding.embed(pos_ids, pos_emb)
+      |> Nx.rename([:seq, :in_dim])
+
+    # token meaning and position; pos_x broadcasts across the batch
+    x = Nx.add(tok_x, pos_x)
+
+    {x, key} =
+      if training,
+        do: MultiHeadAttention.dropout(x, key, keep_prob),
+        else: {x, key}
+
+    {x, key} =
+      Enum.reduce(blocks, {x, key}, fn block_params, {x_acc, k} ->
+        TransformerBlock.forward(x_acc, block_params, k,
+          training: training, dropout_rate: dropout_rate)
+      end)
+
+    x = LayerNorm.normalize(x, final_norm)
+      |> Nx.rename([:batch, :seq, :in_dim])
+
+    logits = Nx.dot(x, [:in_dim], out_head, [:in_dim])
+
+    {logits, key}
+  end
+
+  # Greedy autoregressive generation.
+  def generate(params, token_ids, max_new_tokens, context_size) do
+    key = Nx.Random.key(0)
+
+    Enum.reduce(1..max_new_tokens, token_ids, fn _, ids ->
+      {_batch, seq_len} = Nx.shape(ids)
+
+      # Crop to the last context_size tokens when sequence grows beyond the window
+      ids_cond =
+        if seq_len > context_size do
+          Nx.slice_along_axis(ids, seq_len - context_size, context_size, axis: 1)
+        else
+          ids
+        end
+
+      # Full forward pass; no dropout in inference mode
+      {logits, _key} = forward(ids_cond, params, key)
+
+      # Discard all but the final time step: [batch, vocab_size]
+      {_b, seq_cond, _v} = Nx.shape(logits)
+      last_logits =
+        Nx.slice_along_axis(logits, seq_cond - 1, 1, axis: 1)
+        |> Nx.squeeze(axes: [1])
+
+      # Greedy decode: the token with the highest logit score
+      next_id =
+        Nx.argmax(last_logits, axis: -1)
+        |> Nx.new_axis(1)
+
+      # Grow the sequence by one token
+      Nx.concatenate([ids, next_id], axis: 1)
+    end)
+  end
+
+end
+
+```
+
+## Running the Model End-to-End
+
+In this final section, we run the full model end-to-end and generate text.
+
+Starting from an initial sequence of tokens, the model repeatedly predicts the next token and appends it to the sequence. At each step, it looks at the current context, produces logits over the vocabulary, and selects the most likely next token using greedy decoding.
+
+Because the model is untrained, the output is not meaningful, but the goal here is not quality instead, it is to demonstrate that the entire pipeline works. From embeddings, through stacked transformer blocks, all the way to token prediction, we now have a complete (if simple) GPT-style text generator.
+
+```elixir
+cfg_gpt = %{
+  vocab_size:     50257,   # full GPT-2 / GPT-3 BPE vocabulary
+  context_length: 1024,
+  d_model:        8,
+  num_heads:      2,       # head_dim = 4
+  n_layers:       2,
+  dropout_rate:   0.1      # off for a deterministic demo
+}
+
+key = Nx.Random.key(42)
+{model_params, _key} = GPTModel.init(cfg_gpt, key)
+
+prompt    = "Every step forward"
+start_ids = Gpt3Tokenizer.encode(prompt)
+token_ids = Nx.tensor([start_ids])
+
+{logits, _} = GPTModel.forward(token_ids, model_params, Nx.Random.key(0))
+IO.inspect(Nx.shape(logits), label: "Logits shape [batch, seq, vocab_size]")
+
+generated_ids = GPTModel.generate(model_params, token_ids, 6, cfg_gpt[:context_length])
+IO.inspect(Nx.shape(generated_ids), label: "Generated shape [batch, seq + new_tokens]")
+
+generated_list =
+  generated_ids
+  |> Nx.squeeze(axes: [:batch])
+  |> Nx.to_flat_list()
+
+IO.puts("Prompt:    #{prompt}")
+IO.puts("Generated: #{Gpt3Tokenizer.decode(generated_list)}")
+```
